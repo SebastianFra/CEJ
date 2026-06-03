@@ -226,12 +226,51 @@ def send_ntfy(server, topic, listing):
     resp.raise_for_status()
 
 
+def try_accept_cookies(page):
+    """Best-effort dismissal of a cookie-consent wall, which often blocks the
+    listing content from rendering. Tries known vendors then generic labels."""
+    selectors = [
+        "#onetrust-accept-btn-handler",
+        "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+        "#CybotCookiebotDialogBodyButtonAccept",
+        "button#coiConsentBannerAcceptAll",
+        ".coi-banner__accept",
+        "[data-cookiebanner] button",
+    ]
+    texts = ["Accepter alle", "Tillad alle", "Godkend alle", "Accepter",
+             "Accept all", "Allow all", "Jeg accepterer", "Godkend", "OK"]
+    for sel in selectors:
+        try:
+            el = page.query_selector(sel)
+            if el and el.is_visible():
+                el.click(timeout=2000)
+                log(f"Cookie consent: clicked selector {sel}")
+                return True
+        except Exception:
+            pass
+    for txt in texts:
+        try:
+            btn = page.get_by_role("button", name=txt, exact=False).first
+            if btn and btn.is_visible():
+                btn.click(timeout=2000)
+                log(f"Cookie consent: clicked button '{txt}'")
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def scrape(config):
     from playwright.sync_api import sync_playwright
 
     json_blobs = []
     json_sources = []  # parallel to json_blobs: the URL each blob came from
+    responses_meta = []  # url + content-type for every response, for diagnostics
     DEBUG_DIR.mkdir(exist_ok=True)
+
+    api_url_re = re.compile(
+        r"(api|graphql|search|bolig|residence|listing|ejendom|lejemaal|lejem"
+        r"|property|udlejning|\.json)", re.I)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -254,25 +293,41 @@ def scrape(config):
                 ctype = (response.headers or {}).get("content-type", "")
             except Exception:
                 ctype = ""
-            if "json" not in ctype.lower():
-                return
-            try:
-                json_blobs.append(response.json())
-                json_sources.append(response.url)
-            except Exception:
-                pass
+            url = response.url
+            responses_meta.append({"url": url, "ctype": ctype})
+            low = ctype.lower()
+            # Capture JSON by content-type OR when the URL looks like a data API
+            # whose response isn't served as text/html.
+            if "json" in low or (api_url_re.search(url) and "html" not in low and "javascript" not in low):
+                try:
+                    data = response.json()
+                except Exception:
+                    try:
+                        data = json.loads(response.text())
+                    except Exception:
+                        data = None
+                if data is not None:
+                    json_blobs.append(data)
+                    json_sources.append(url)
 
         page.on("response", on_response)
 
         log(f"Navigating to {config['url']}")
-        page.goto(config["url"], wait_until="networkidle", timeout=60000)
-        # Give client-side rendering / lazy XHRs a moment.
-        time.sleep(5)
+        page.goto(config["url"], wait_until="domcontentloaded", timeout=60000)
+        time.sleep(2)
+        try_accept_cookies(page)
+
+        # Let client-side rendering / lazy XHRs settle, scrolling to trigger them.
         try:
-            page.mouse.wheel(0, 4000)
-            time.sleep(3)
+            page.wait_for_load_state("networkidle", timeout=30000)
         except Exception:
             pass
+        for _ in range(4):
+            try:
+                page.mouse.wheel(0, 5000)
+            except Exception:
+                pass
+            time.sleep(2)
 
         html = page.content()
         (DEBUG_DIR / "page.html").write_text(html, encoding="utf-8")
@@ -280,29 +335,77 @@ def scrape(config):
             json.dumps(json_blobs, ensure_ascii=False)[:2_000_000],
             encoding="utf-8",
         )
+        (DEBUG_DIR / "responses.json").write_text(
+            json.dumps(responses_meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
-        # Diagnostics: what JSON did the page actually fetch?
-        log(f"Captured {len(json_blobs)} JSON response(s):")
+        # ---- Diagnostics: describe what actually loaded ----
+        try:
+            title = page.title()
+        except Exception:
+            title = "?"
+        log(f"Page title={title!r}; html={len(html)} bytes; "
+            f"{len(responses_meta)} responses, {len(json_blobs)} JSON-ish.")
+        try:
+            counts = page.evaluate(
+                """() => ({
+                    a: document.querySelectorAll('a').length,
+                    article: document.querySelectorAll('article').length,
+                    cards: document.querySelectorAll(
+                        '[class*=card],[class*=listing],[class*=bolig],[class*=property],[class*=result],[class*=item]'
+                    ).length,
+                    iframes: document.querySelectorAll('iframe').length
+                })""")
+            log(f"Element counts: {counts}")
+        except Exception as e:
+            log(f"Element count probe failed: {e}")
+
+        frames = page.frames
+        if len(frames) > 1:
+            log(f"Frames ({len(frames)}):")
+            for fr in frames:
+                log(f"  frame: {fr.url}")
+
+        log("Data-ish responses captured:")
+        shown = 0
+        for m in responses_meta:
+            if api_url_re.search(m["url"]):
+                log(f"  [{m['ctype'][:30]:30}] {m['url'][:170]}")
+                shown += 1
+            if shown >= 40:
+                break
+        if shown == 0:
+            log("  (none — page made no listing-data requests we could see)")
+
         for src, blob in zip(json_sources, json_blobs):
-            log(f"  <= {src}  ::  {describe_shape(blob)}")
+            log(f"  JSON <= {src[:120]}  ::  {describe_shape(blob)}")
 
+        try:
+            body_text = page.evaluate(
+                "() => document.body ? document.body.innerText.slice(0, 600) : ''")
+            log("Body text snippet: " + " ".join(body_text.split())[:600])
+        except Exception:
+            pass
+
+        # ---- Extraction: JSON first, then DOM across all frames ----
         listings = extract_from_json(json_blobs, config["url"])
         source = "json-api"
         if not listings:
-            log("No listings found in captured JSON; falling back to DOM scrape.")
-            listings = extract_from_dom(page, config["url"])
-            source = "dom"
-            # Diagnostics: show a sample of anchors so we can tune the selector.
-            all_anchors = page.eval_on_selector_all(
-                "a", "els => els.map(a => a.href).filter(Boolean)"
-            )
-            sample = [h for h in all_anchors if not h.startswith(("mailto:", "tel:"))]
-            log(f"DOM fallback: {len(all_anchors)} anchors on page; sample hrefs:")
-            for h in sample[:25]:
-                log(f"    {h}")
+            log("No listings in captured JSON; trying DOM scrape across frames.")
+            for fr in frames:
+                try:
+                    found = extract_from_dom(fr, config["url"])
+                except Exception:
+                    found = []
+                if found:
+                    listings = found
+                    source = "dom" if fr is page.main_frame else "iframe-dom"
+                    break
 
-        # Cheap bot-wall detection for clearer logs.
-        if not listings and re.search(r"(captcha|cloudflare|just a moment|attention required)", html, re.I):
+        if not listings and re.search(
+                r"(captcha|cloudflare|just a moment|attention required|verify you are human)",
+                html, re.I):
             log("WARNING: page looks like a bot/Cloudflare challenge — runner IP may be blocked.")
 
         browser.close()
