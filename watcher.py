@@ -58,6 +58,17 @@ def log(msg):
     print(f"[watcher] {msg}", flush=True)
 
 
+def describe_shape(node, depth=0):
+    """Compact, log-friendly summary of a parsed-JSON structure."""
+    if isinstance(node, dict):
+        keys = list(node.keys())
+        return "{" + ", ".join(keys[:12]) + ("…" if len(keys) > 12 else "") + "}"
+    if isinstance(node, list):
+        head = describe_shape(node[0], depth + 1) if node else ""
+        return f"[{len(node)} x {head}]"
+    return type(node).__name__
+
+
 def load_json(path, default):
     try:
         return json.loads(Path(path).read_text(encoding="utf-8"))
@@ -184,7 +195,13 @@ def extract_from_dom(page, base_url):
         text = a.get("text") or ""
         if not href or len(text) < 4:
             continue
-        if not re.search(r"(bolig|lejlighed|residence|ejendom|find-bolig)", href, re.I):
+        # Only real navigable links — never contact/util links.
+        if not href.startswith(("http://", "https://")):
+            continue
+        # A listing is a *detail* page, not the search/overview page itself.
+        if re.search(r"(overblik|find-bolig/?$|/find-bolig\?)", href, re.I):
+            continue
+        if not re.search(r"(bolig|lejlighed|residence|ejendom)", href, re.I):
             continue
         uid = "url:" + href
         if uid in seen_ids:
@@ -213,6 +230,7 @@ def scrape(config):
     from playwright.sync_api import sync_playwright
 
     json_blobs = []
+    json_sources = []  # parallel to json_blobs: the URL each blob came from
     DEBUG_DIR.mkdir(exist_ok=True)
 
     with sync_playwright() as p:
@@ -232,11 +250,15 @@ def scrape(config):
         page = context.new_page()
 
         def on_response(response):
-            ctype = (response.headers or {}).get("content-type", "")
+            try:
+                ctype = (response.headers or {}).get("content-type", "")
+            except Exception:
+                ctype = ""
             if "json" not in ctype.lower():
                 return
             try:
                 json_blobs.append(response.json())
+                json_sources.append(response.url)
             except Exception:
                 pass
 
@@ -259,12 +281,25 @@ def scrape(config):
             encoding="utf-8",
         )
 
+        # Diagnostics: what JSON did the page actually fetch?
+        log(f"Captured {len(json_blobs)} JSON response(s):")
+        for src, blob in zip(json_sources, json_blobs):
+            log(f"  <= {src}  ::  {describe_shape(blob)}")
+
         listings = extract_from_json(json_blobs, config["url"])
         source = "json-api"
         if not listings:
             log("No listings found in captured JSON; falling back to DOM scrape.")
             listings = extract_from_dom(page, config["url"])
             source = "dom"
+            # Diagnostics: show a sample of anchors so we can tune the selector.
+            all_anchors = page.eval_on_selector_all(
+                "a", "els => els.map(a => a.href).filter(Boolean)"
+            )
+            sample = [h for h in all_anchors if not h.startswith(("mailto:", "tel:"))]
+            log(f"DOM fallback: {len(all_anchors)} anchors on page; sample hrefs:")
+            for h in sample[:25]:
+                log(f"    {h}")
 
         # Cheap bot-wall detection for clearer logs.
         if not listings and re.search(r"(captcha|cloudflare|just a moment|attention required)", html, re.I):
