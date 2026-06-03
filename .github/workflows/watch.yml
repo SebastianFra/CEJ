@@ -1,0 +1,63 @@
+name: Watch CEJ apartments
+
+on:
+  schedule:
+    # Every 5 minutes is the minimum GitHub allows. Real dispatch is often
+    # delayed several minutes when the runner queue is busy.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+
+# Only one run at a time so two runs can't both append to state/seen.json.
+concurrency:
+  group: cej-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # needed to commit the updated state/seen.json back
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run watcher
+        env:
+          # Optional overrides. If you'd rather not keep the topic in config.json,
+          # set a repo secret named NTFY_TOPIC and it takes precedence.
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_SERVER: ${{ secrets.NTFY_SERVER }}
+        run: python watcher.py
+
+      - name: Commit updated state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- state/seen.json; then
+            git add state/seen.json
+            git commit -m "Update seen apartments state [skip ci]"
+            git push
+          else
+            echo "No state change."
+          fi
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_id }}
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 7

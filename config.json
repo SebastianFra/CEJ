@@ -1,0 +1,7 @@
+{
+  "url": "https://udlejning.cej.dk/find-bolig/overblik?p=sj%C3%A6lland",
+  "ntfy_server": "https://ntfy.sh",
+  "ntfy_topic": "cej-sjaelland-62ce0459ece5",
+  "notify_on_first_run": false,
+  "max_notifications_per_run": 15
+}
