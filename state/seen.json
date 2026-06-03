@@ -1,4 +1,7 @@
 {
-  "seeded": false,
-  "ids": []
+  "seeded": true,
+  "ids": [
+    "url:mailto:bolig@cej.dk",
+    "url:mailto:boligudlejning@cej.dk"
+  ]
 }
